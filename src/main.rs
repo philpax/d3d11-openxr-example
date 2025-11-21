@@ -2,8 +2,8 @@
 //!
 //! Renders a spinning RGB triangle 1 meter in front of the user.
 //!
-//! This example uses minimal abstraction for clarity. Real-world code should encapsulate and
-//! largely decouple its D3D11 and OpenXR components and handle errors gracefully.
+//! This code has been designed to clearly separate OpenXR and graphics concerns.
+//! Look for "INTERFACE POINT" comments to see where OpenXR and graphics systems interact.
 
 use std::mem;
 use std::sync::{
@@ -18,51 +18,17 @@ use windows::{
     Win32::Graphics::Direct3D11::*, Win32::Graphics::Dxgi::Common::*, core::*,
 };
 
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct Vertex {
-    position: [f32; 3],
-    color: [f32; 3],
-}
+// ============================================================================
+// CONSTANTS
+// ============================================================================
 
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct TransformBuffer {
-    view_proj: [[f32; 16]; 2], // Two 4x4 matrices for stereo
-    model: [f32; 16],          // 4x4 model matrix
-}
+const COLOR_FORMAT: u32 = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB.0 as u32;
+const VIEW_COUNT: u32 = 2;
+const VIEW_TYPE: xr::ViewConfigurationType = xr::ViewConfigurationType::PRIMARY_STEREO;
 
-// Helper function to create model matrix from position and scale
-fn model_matrix_from_pose(pos: &xr::Vector3f, quat: &xr::Quaternionf, scale: f32) -> [f32; 16] {
-    let xx = quat.x * quat.x;
-    let yy = quat.y * quat.y;
-    let zz = quat.z * quat.z;
-    let xy = quat.x * quat.y;
-    let xz = quat.x * quat.z;
-    let yz = quat.y * quat.z;
-    let wx = quat.w * quat.x;
-    let wy = quat.w * quat.y;
-    let wz = quat.w * quat.z;
-
-    [
-        scale * (1.0 - 2.0 * (yy + zz)),
-        scale * (2.0 * (xy + wz)),
-        scale * (2.0 * (xz - wy)),
-        0.0,
-        scale * (2.0 * (xy - wz)),
-        scale * (1.0 - 2.0 * (xx + zz)),
-        scale * (2.0 * (yz + wx)),
-        0.0,
-        scale * (2.0 * (xz + wy)),
-        scale * (2.0 * (yz - wx)),
-        scale * (1.0 - 2.0 * (xx + yy)),
-        0.0,
-        pos.x,
-        pos.y,
-        pos.z,
-        1.0,
-    ]
-}
+// ============================================================================
+// MAIN
+// ============================================================================
 
 pub fn main() {
     // Handle interrupts gracefully
@@ -77,6 +43,259 @@ pub fn main() {
     #[link(name = "advapi32")]
     unsafe extern "C" {}
 
+    // Initialize OpenXR instance and system
+    let (xr_instance, system, environment_blend_mode) = init_openxr_instance();
+
+    unsafe {
+        // Initialize D3D11 graphics
+        let d3d = init_d3d11();
+        let resources = create_render_resources(&d3d.device);
+
+        // Create OpenXR session (INTERFACE POINT: passes D3D device to OpenXR)
+        let mut xr_ctx = create_openxr_session(&xr_instance, system, &d3d.device);
+
+        // Setup input tracking
+        let input = setup_input_tracking(&xr_instance, &xr_ctx.session);
+
+        // Main loop state
+        let mut swapchain: Option<OpenXrSwapchain> = None;
+        let mut event_storage = xr::EventDataBuffer::new();
+        let mut session_running = false;
+        let start_time = std::time::Instant::now();
+
+        'main_loop: loop {
+            // Handle Ctrl+C
+            if !running.load(Ordering::Relaxed) {
+                println!("requesting exit");
+                match xr_ctx.session.request_exit() {
+                    Ok(()) => {}
+                    Err(xr::sys::Result::ERROR_SESSION_NOT_RUNNING) => break,
+                    Err(e) => panic!("{}", e),
+                }
+            }
+
+            // Poll OpenXR events
+            while let Some(event) = xr_instance.poll_event(&mut event_storage).unwrap() {
+                use xr::Event::*;
+                match event {
+                    SessionStateChanged(e) => {
+                        println!("entered state {:?}", e.state());
+                        if handle_session_state(&xr_ctx.session, e.state(), &mut session_running) {
+                            break 'main_loop;
+                        }
+                    }
+                    InstanceLossPending(_) => break 'main_loop,
+                    EventsLost(e) => println!("lost {} events", e.lost_event_count()),
+                    _ => {}
+                }
+            }
+
+            if !session_running {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+
+            // OPENXR: Begin frame and check if we should render
+            let xr_frame_state = xr_ctx.frame_wait.wait().unwrap();
+            xr_ctx.frame_stream.begin().unwrap();
+
+            if !xr_frame_state.should_render {
+                xr_ctx
+                    .frame_stream
+                    .end(
+                        xr_frame_state.predicted_display_time,
+                        environment_blend_mode,
+                        &[],
+                    )
+                    .unwrap();
+                continue;
+            }
+
+            // OPENXR: Create swapchain on first render (INTERFACE POINT)
+            let swapchain = swapchain.get_or_insert_with(|| {
+                create_openxr_swapchain(&xr_instance, system, &xr_ctx.session, &d3d.device)
+            });
+
+            // OPENXR: Acquire swapchain image
+            let image_index = swapchain.handle.acquire_image().unwrap();
+            swapchain.handle.wait_image(xr::Duration::INFINITE).unwrap();
+
+            // OPENXR: Get view transforms for this frame
+            let (_, views) = xr_ctx
+                .session
+                .locate_views(
+                    VIEW_TYPE,
+                    xr_frame_state.predicted_display_time,
+                    &xr_ctx.stage,
+                )
+                .unwrap();
+
+            // Calculate rotating model matrix
+            let elapsed = start_time.elapsed().as_secs_f32();
+            let rotation_angle = elapsed * 0.5;
+
+            // GRAPHICS: Render the scene
+            let rtv = &swapchain.render_target_views[image_index as usize];
+            let clear_color = [0.0f32, 0.0, 0.0, 1.0];
+            d3d.device_context.ClearRenderTargetView(rtv, &clear_color);
+            d3d.device_context
+                .OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+
+            setup_pipeline_state(&d3d.device_context, &resources, swapchain.resolution);
+
+            // Draw main triangle
+            update_transforms(
+                &d3d.device_context,
+                &resources.constant_buffer,
+                &views,
+                compute_model_matrix(rotation_angle),
+            );
+            d3d.device_context.DrawInstanced(3, VIEW_COUNT, 0, 0);
+
+            // OPENXR: Get hand tracking data
+            xr_ctx
+                .session
+                .sync_actions(&[(&input.action_set).into()])
+                .unwrap();
+
+            let right_location = input
+                .right_space
+                .locate(&xr_ctx.stage, xr_frame_state.predicted_display_time)
+                .unwrap();
+            let left_location = input
+                .left_space
+                .locate(&xr_ctx.stage, xr_frame_state.predicted_display_time)
+                .unwrap();
+
+            // Draw hand triangles
+            if input
+                .left_action
+                .is_active(&xr_ctx.session, xr::Path::NULL)
+                .unwrap()
+                && left_location
+                    .location_flags
+                    .contains(xr::SpaceLocationFlags::POSITION_VALID)
+            {
+                update_transforms(
+                    &d3d.device_context,
+                    &resources.constant_buffer,
+                    &views,
+                    model_matrix_from_pose(
+                        &left_location.pose.position,
+                        &left_location.pose.orientation,
+                        0.1,
+                    ),
+                );
+                d3d.device_context.DrawInstanced(3, VIEW_COUNT, 0, 0);
+            }
+
+            if input
+                .right_action
+                .is_active(&xr_ctx.session, xr::Path::NULL)
+                .unwrap()
+                && right_location
+                    .location_flags
+                    .contains(xr::SpaceLocationFlags::POSITION_VALID)
+            {
+                update_transforms(
+                    &d3d.device_context,
+                    &resources.constant_buffer,
+                    &views,
+                    model_matrix_from_pose(
+                        &right_location.pose.position,
+                        &right_location.pose.orientation,
+                        0.1,
+                    ),
+                );
+                d3d.device_context.DrawInstanced(3, VIEW_COUNT, 0, 0);
+            }
+
+            // Print hand positions
+            let mut printed = false;
+            if input
+                .left_action
+                .is_active(&xr_ctx.session, xr::Path::NULL)
+                .unwrap()
+            {
+                print!(
+                    "Left Hand: ({:0<12},{:0<12},{:0<12}), ",
+                    left_location.pose.position.x,
+                    left_location.pose.position.y,
+                    left_location.pose.position.z
+                );
+                printed = true;
+            }
+
+            if input
+                .right_action
+                .is_active(&xr_ctx.session, xr::Path::NULL)
+                .unwrap()
+            {
+                print!(
+                    "Right Hand: ({:0<12},{:0<12},{:0<12})",
+                    right_location.pose.position.x,
+                    right_location.pose.position.y,
+                    right_location.pose.position.z
+                );
+                printed = true;
+            }
+            if printed {
+                println!();
+            }
+
+            // OPENXR: Release swapchain image
+            let rect = xr::Rect2Di {
+                offset: xr::Offset2Di { x: 0, y: 0 },
+                extent: xr::Extent2Di {
+                    width: swapchain.resolution.0 as _,
+                    height: swapchain.resolution.1 as _,
+                },
+            };
+
+            swapchain.handle.release_image().unwrap();
+
+            // OPENXR: End frame and submit layers
+            xr_ctx
+                .frame_stream
+                .end(
+                    xr_frame_state.predicted_display_time,
+                    environment_blend_mode,
+                    &[&xr::CompositionLayerProjection::new()
+                        .space(&xr_ctx.stage)
+                        .views(&[
+                            xr::CompositionLayerProjectionView::new()
+                                .pose(views[0].pose)
+                                .fov(views[0].fov)
+                                .sub_image(
+                                    xr::SwapchainSubImage::new()
+                                        .swapchain(&swapchain.handle)
+                                        .image_array_index(0)
+                                        .image_rect(rect),
+                                ),
+                            xr::CompositionLayerProjectionView::new()
+                                .pose(views[1].pose)
+                                .fov(views[1].fov)
+                                .sub_image(
+                                    xr::SwapchainSubImage::new()
+                                        .swapchain(&swapchain.handle)
+                                        .image_array_index(1)
+                                        .image_rect(rect),
+                                ),
+                        ])],
+                )
+                .unwrap();
+        }
+    }
+
+    println!("exiting cleanly");
+}
+
+// ============================================================================
+// HIGH-LEVEL INITIALIZATION (called directly from main)
+// ============================================================================
+
+/// Initialize OpenXR instance and system
+fn init_openxr_instance() -> (xr::Instance, xr::SystemId, xr::EnvironmentBlendMode) {
     #[cfg(feature = "static")]
     let entry = xr::Entry::linked();
     #[cfg(not(feature = "static"))]
@@ -91,7 +310,7 @@ pub fn main() {
     let mut enabled_extensions = xr::ExtensionSet::default();
     enabled_extensions.khr_d3d11_enable = true;
 
-    let xr_instance = entry
+    let instance = entry
         .create_instance(
             &xr::ApplicationInfo {
                 application_name: "d3d11-openxr-example",
@@ -105,29 +324,25 @@ pub fn main() {
         )
         .unwrap();
 
-    let instance_props = xr_instance.properties().unwrap();
+    let instance_props = instance.properties().unwrap();
     println!(
         "loaded OpenXR runtime: {} {}",
         instance_props.runtime_name, instance_props.runtime_version
     );
 
-    let system = xr_instance
+    let system = instance
         .system(xr::FormFactor::HEAD_MOUNTED_DISPLAY)
         .unwrap();
 
-    let environment_blend_mode = xr_instance
+    let environment_blend_mode = instance
         .enumerate_environment_blend_modes(system, VIEW_TYPE)
         .unwrap()[0];
 
-    let requirements = xr_instance
-        .graphics_requirements::<xr::D3D11>(system)
-        .unwrap();
+    (instance, system, environment_blend_mode)
+}
 
-    println!(
-        "D3D11 min feature level: {:?}",
-        requirements.min_feature_level
-    );
-
+/// Initialize Direct3D 11 device and context
+unsafe fn init_d3d11() -> D3DContext {
     unsafe {
         let feature_levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
 
@@ -148,69 +363,21 @@ pub fn main() {
         )
         .expect("Failed to create D3D11 device");
 
-        let device = device.unwrap();
-        let device_context = device_context.unwrap();
-
         println!(
             "Created D3D11 device with feature level: {:?}",
             feature_level
         );
 
-        let (session, mut frame_wait, mut frame_stream) = xr_instance
-            .create_session::<xr::D3D11>(
-                system,
-                &xr::d3d::SessionCreateInfoD3D11 {
-                    device: device.as_raw() as *mut _,
-                },
-            )
-            .unwrap();
+        D3DContext {
+            device: device.unwrap(),
+            device_context: device_context.unwrap(),
+        }
+    }
+}
 
-        let action_set = xr_instance
-            .create_action_set("input", "input pose information", 0)
-            .unwrap();
-
-        let right_action = action_set
-            .create_action::<xr::Posef>("right_hand", "Right Hand Controller", &[])
-            .unwrap();
-        let left_action = action_set
-            .create_action::<xr::Posef>("left_hand", "Left Hand Controller", &[])
-            .unwrap();
-
-        xr_instance
-            .suggest_interaction_profile_bindings(
-                xr_instance
-                    .string_to_path("/interaction_profiles/khr/simple_controller")
-                    .unwrap(),
-                &[
-                    xr::Binding::new(
-                        &right_action,
-                        xr_instance
-                            .string_to_path("/user/hand/right/input/grip/pose")
-                            .unwrap(),
-                    ),
-                    xr::Binding::new(
-                        &left_action,
-                        xr_instance
-                            .string_to_path("/user/hand/left/input/grip/pose")
-                            .unwrap(),
-                    ),
-                ],
-            )
-            .unwrap();
-
-        session.attach_action_sets(&[&action_set]).unwrap();
-
-        let right_space = right_action
-            .create_space(&session, xr::Path::NULL, xr::Posef::IDENTITY)
-            .unwrap();
-        let left_space = left_action
-            .create_space(&session, xr::Path::NULL, xr::Posef::IDENTITY)
-            .unwrap();
-
-        let stage = session
-            .create_reference_space(xr::ReferenceSpaceType::STAGE, xr::Posef::IDENTITY)
-            .unwrap();
-
+/// Create all graphics pipeline resources
+unsafe fn create_render_resources(device: &ID3D11Device) -> RenderResources {
+    unsafe {
         // Compile shaders
         let shader_code = include_str!("d3d11_triangle.hlsl");
         let vs_blob = compile_shader(shader_code, "VSMain", "vs_5_0");
@@ -385,344 +552,274 @@ pub fn main() {
             .expect("Failed to create depth stencil state");
         let depth_stencil_state = depth_stencil_state.unwrap();
 
-        // Main loop
-        let mut swapchain: Option<Swapchain> = None;
-        let mut event_storage = xr::EventDataBuffer::new();
-        let mut session_running = false;
-        let start_time = std::time::Instant::now();
+        RenderResources {
+            vertex_shader,
+            pixel_shader,
+            input_layout,
+            vertex_buffer,
+            constant_buffer,
+            blend_state,
+            rasterizer_state,
+            depth_stencil_state,
+        }
+    }
+}
 
-        'main_loop: loop {
-            if !running.load(Ordering::Relaxed) {
-                println!("requesting exit");
-                match session.request_exit() {
-                    Ok(()) => {}
-                    Err(xr::sys::Result::ERROR_SESSION_NOT_RUNNING) => break,
-                    Err(e) => panic!("{}", e),
-                }
-            }
+/// Create OpenXR session with D3D11 device (INTERFACE POINT: OpenXR <-> Graphics)
+fn create_openxr_session(
+    instance: &xr::Instance,
+    system: xr::SystemId,
+    d3d_device: &ID3D11Device,
+) -> OpenXrContext {
+    let requirements = instance.graphics_requirements::<xr::D3D11>(system).unwrap();
 
-            while let Some(event) = xr_instance.poll_event(&mut event_storage).unwrap() {
-                use xr::Event::*;
-                match event {
-                    SessionStateChanged(e) => {
-                        println!("entered state {:?}", e.state());
-                        match e.state() {
-                            xr::SessionState::READY => {
-                                session.begin(VIEW_TYPE).unwrap();
-                                session_running = true;
-                            }
-                            xr::SessionState::STOPPING => {
-                                session.end().unwrap();
-                                session_running = false;
-                            }
-                            xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => {
-                                break 'main_loop;
-                            }
-                            _ => {}
-                        }
-                    }
-                    InstanceLossPending(_) => break 'main_loop,
-                    EventsLost(e) => println!("lost {} events", e.lost_event_count()),
-                    _ => {}
-                }
-            }
+    println!(
+        "D3D11 min feature level: {:?}",
+        requirements.min_feature_level
+    );
 
-            if !session_running {
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            }
+    let (session, frame_wait, frame_stream) = unsafe {
+        instance
+            .create_session::<xr::D3D11>(
+                system,
+                &xr::d3d::SessionCreateInfoD3D11 {
+                    device: d3d_device.as_raw() as *mut _,
+                },
+            )
+            .unwrap()
+    };
 
-            let xr_frame_state = frame_wait.wait().unwrap();
-            frame_stream.begin().unwrap();
+    let stage = session
+        .create_reference_space(xr::ReferenceSpaceType::STAGE, xr::Posef::IDENTITY)
+        .unwrap();
 
-            if !xr_frame_state.should_render {
-                frame_stream
-                    .end(
-                        xr_frame_state.predicted_display_time,
-                        environment_blend_mode,
-                        &[],
-                    )
-                    .unwrap();
-                continue;
-            }
+    OpenXrContext {
+        _instance: instance.clone(),
+        _system: system,
+        session,
+        frame_wait,
+        frame_stream,
+        stage,
+    }
+}
 
-            let swapchain = swapchain.get_or_insert_with(|| {
-                let views = xr_instance
-                    .enumerate_view_configuration_views(system, VIEW_TYPE)
-                    .unwrap();
-                assert_eq!(views.len(), VIEW_COUNT as usize);
+/// Setup OpenXR input tracking (actions and spaces)
+fn setup_input_tracking(
+    instance: &xr::Instance,
+    session: &xr::Session<xr::D3D11>,
+) -> InputTracking {
+    let action_set = instance
+        .create_action_set("input", "input pose information", 0)
+        .unwrap();
 
-                let resolution = (
-                    views[0].recommended_image_rect_width,
-                    views[0].recommended_image_rect_height,
-                );
+    let right_action = action_set
+        .create_action::<xr::Posef>("right_hand", "Right Hand Controller", &[])
+        .unwrap();
+    let left_action = action_set
+        .create_action::<xr::Posef>("left_hand", "Left Hand Controller", &[])
+        .unwrap();
 
-                let handle = session
-                    .create_swapchain(&xr::SwapchainCreateInfo {
-                        create_flags: xr::SwapchainCreateFlags::EMPTY,
-                        usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT
-                            | xr::SwapchainUsageFlags::SAMPLED,
-                        format: COLOR_FORMAT,
-                        sample_count: 1,
-                        width: resolution.0,
-                        height: resolution.1,
-                        face_count: 1,
-                        array_size: VIEW_COUNT,
-                        mip_count: 1,
-                    })
-                    .unwrap();
+    instance
+        .suggest_interaction_profile_bindings(
+            instance
+                .string_to_path("/interaction_profiles/khr/simple_controller")
+                .unwrap(),
+            &[
+                xr::Binding::new(
+                    &right_action,
+                    instance
+                        .string_to_path("/user/hand/right/input/grip/pose")
+                        .unwrap(),
+                ),
+                xr::Binding::new(
+                    &left_action,
+                    instance
+                        .string_to_path("/user/hand/left/input/grip/pose")
+                        .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
 
-                let images = handle.enumerate_images().unwrap();
-                let render_target_views = images
-                    .iter()
-                    .map(|&texture_ptr| {
-                        let texture: ID3D11Texture2D = ID3D11Texture2D::from_raw(texture_ptr as _);
+    session.attach_action_sets(&[&action_set]).unwrap();
 
-                        let rtv_desc = D3D11_RENDER_TARGET_VIEW_DESC {
-                            Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-                            ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DARRAY,
-                            Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
-                                Texture2DArray: D3D11_TEX2D_ARRAY_RTV {
-                                    MipSlice: 0,
-                                    FirstArraySlice: 0,
-                                    ArraySize: VIEW_COUNT,
-                                },
-                            },
-                        };
+    let right_space = right_action
+        .create_space(session, xr::Path::NULL, xr::Posef::IDENTITY)
+        .unwrap();
+    let left_space = left_action
+        .create_space(session, xr::Path::NULL, xr::Posef::IDENTITY)
+        .unwrap();
 
-                        let mut rtv: Option<ID3D11RenderTargetView> = None;
-                        device
-                            .CreateRenderTargetView(&texture, Some(&rtv_desc), Some(&mut rtv))
-                            .expect("Failed to create render target view");
+    InputTracking {
+        action_set,
+        right_action,
+        left_action,
+        right_space,
+        left_space,
+    }
+}
 
-                        mem::forget(texture);
-                        rtv.unwrap()
-                    })
-                    .collect::<Vec<_>>();
+/// Handle OpenXR session state changes
+fn handle_session_state(
+    session: &xr::Session<xr::D3D11>,
+    state: xr::SessionState,
+    session_running: &mut bool,
+) -> bool {
+    match state {
+        xr::SessionState::READY => {
+            session.begin(VIEW_TYPE).unwrap();
+            *session_running = true;
+        }
+        xr::SessionState::STOPPING => {
+            session.end().unwrap();
+            *session_running = false;
+        }
+        xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => {
+            return true; // Exit main loop
+        }
+        _ => {}
+    }
+    false
+}
 
-                Swapchain {
-                    handle,
-                    resolution,
-                    render_target_views,
-                }
-            });
+/// Create OpenXR swapchain and render target views (INTERFACE POINT: OpenXR <-> Graphics)
+unsafe fn create_openxr_swapchain(
+    instance: &xr::Instance,
+    system: xr::SystemId,
+    session: &xr::Session<xr::D3D11>,
+    d3d_device: &ID3D11Device,
+) -> OpenXrSwapchain {
+    let views = instance
+        .enumerate_view_configuration_views(system, VIEW_TYPE)
+        .unwrap();
+    assert_eq!(views.len(), VIEW_COUNT as usize);
 
-            let image_index = swapchain.handle.acquire_image().unwrap();
-            swapchain.handle.wait_image(xr::Duration::INFINITE).unwrap();
+    let resolution = (
+        views[0].recommended_image_rect_width,
+        views[0].recommended_image_rect_height,
+    );
 
-            // Calculate rotation based on elapsed time
-            let elapsed = start_time.elapsed().as_secs_f32();
-            let rotation_angle = elapsed * 0.5; // Rotate at 0.5 radians per second
+    let handle = session
+        .create_swapchain(&xr::SwapchainCreateInfo {
+            create_flags: xr::SwapchainCreateFlags::EMPTY,
+            usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT
+                | xr::SwapchainUsageFlags::SAMPLED,
+            format: COLOR_FORMAT,
+            sample_count: 1,
+            width: resolution.0,
+            height: resolution.1,
+            face_count: 1,
+            array_size: VIEW_COUNT,
+            mip_count: 1,
+        })
+        .unwrap();
 
-            let (_, views) = session
-                .locate_views(VIEW_TYPE, xr_frame_state.predicted_display_time, &stage)
-                .unwrap();
+    let images = handle.enumerate_images().unwrap();
+    let render_target_views = images
+        .iter()
+        .map(|&texture_ptr| unsafe {
+            let texture: ID3D11Texture2D = ID3D11Texture2D::from_raw(texture_ptr as _);
 
-            // Update constant buffer with view-projection matrices and model matrix
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            device_context
-                .Map(
-                    &constant_buffer,
-                    0,
-                    D3D11_MAP_WRITE_DISCARD,
-                    0,
-                    Some(&mut mapped),
-                )
-                .expect("Failed to map constant buffer");
-
-            let transform_data = mapped.pData as *mut TransformBuffer;
-            (*transform_data).view_proj[0] = compute_view_proj_matrix(&views[0]);
-            (*transform_data).view_proj[1] = compute_view_proj_matrix(&views[1]);
-            (*transform_data).model = compute_model_matrix(rotation_angle);
-
-            device_context.Unmap(&constant_buffer, 0);
-
-            // Render
-            let rtv = &swapchain.render_target_views[image_index as usize];
-            let clear_color = [0.0f32, 0.0, 0.0, 1.0];
-            device_context.ClearRenderTargetView(rtv, &clear_color);
-
-            device_context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
-
-            let viewport = D3D11_VIEWPORT {
-                TopLeftX: 0.0,
-                TopLeftY: 0.0,
-                Width: swapchain.resolution.0 as f32,
-                Height: swapchain.resolution.1 as f32,
-                MinDepth: 0.0,
-                MaxDepth: 1.0,
-            };
-            device_context.RSSetViewports(Some(&[viewport]));
-
-            device_context.IASetInputLayout(&input_layout);
-            device_context.VSSetShader(&vertex_shader, None);
-            device_context.PSSetShader(&pixel_shader, None);
-            device_context.VSSetConstantBuffers(0, Some(&[Some(constant_buffer.clone())]));
-            device_context.OMSetBlendState(&blend_state, None, 0xffffffff);
-            device_context.RSSetState(&rasterizer_state);
-            device_context.OMSetDepthStencilState(&depth_stencil_state, 0);
-            device_context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-            let stride = mem::size_of::<Vertex>() as u32;
-            let offset = 0u32;
-            device_context.IASetVertexBuffers(
-                0,
-                1,
-                Some(&Some(vertex_buffer.clone())),
-                Some(&stride),
-                Some(&offset),
-            );
-
-            // Draw main triangle
-            device_context.DrawInstanced(3, VIEW_COUNT, 0, 0);
-
-            // Get hand positions before releasing swapchain image
-            session.sync_actions(&[(&action_set).into()]).unwrap();
-
-            let right_location = right_space
-                .locate(&stage, xr_frame_state.predicted_display_time)
-                .unwrap();
-            let left_location = left_space
-                .locate(&stage, xr_frame_state.predicted_display_time)
-                .unwrap();
-
-            // Draw hand triangles
-            if left_action.is_active(&session, xr::Path::NULL).unwrap()
-                && left_location
-                    .location_flags
-                    .contains(xr::SpaceLocationFlags::POSITION_VALID)
-            {
-                let mut hand_mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                device_context
-                    .Map(
-                        &constant_buffer,
-                        0,
-                        D3D11_MAP_WRITE_DISCARD,
-                        0,
-                        Some(&mut hand_mapped),
-                    )
-                    .expect("Failed to map constant buffer");
-
-                let transform_data = hand_mapped.pData as *mut TransformBuffer;
-                (*transform_data).view_proj[0] = compute_view_proj_matrix(&views[0]);
-                (*transform_data).view_proj[1] = compute_view_proj_matrix(&views[1]);
-                (*transform_data).model = model_matrix_from_pose(
-                    &left_location.pose.position,
-                    &left_location.pose.orientation,
-                    0.1, // Smaller scale for hand triangles
-                );
-
-                device_context.Unmap(&constant_buffer, 0);
-                device_context.DrawInstanced(3, VIEW_COUNT, 0, 0);
-            }
-
-            if right_action.is_active(&session, xr::Path::NULL).unwrap()
-                && right_location
-                    .location_flags
-                    .contains(xr::SpaceLocationFlags::POSITION_VALID)
-            {
-                let mut hand_mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                device_context
-                    .Map(
-                        &constant_buffer,
-                        0,
-                        D3D11_MAP_WRITE_DISCARD,
-                        0,
-                        Some(&mut hand_mapped),
-                    )
-                    .expect("Failed to map constant buffer");
-
-                let transform_data = hand_mapped.pData as *mut TransformBuffer;
-                (*transform_data).view_proj[0] = compute_view_proj_matrix(&views[0]);
-                (*transform_data).view_proj[1] = compute_view_proj_matrix(&views[1]);
-                (*transform_data).model = model_matrix_from_pose(
-                    &right_location.pose.position,
-                    &right_location.pose.orientation,
-                    0.1, // Smaller scale for hand triangles
-                );
-
-                device_context.Unmap(&constant_buffer, 0);
-                device_context.DrawInstanced(3, VIEW_COUNT, 0, 0);
-            }
-
-            let mut printed = false;
-            if left_action.is_active(&session, xr::Path::NULL).unwrap() {
-                print!(
-                    "Left Hand: ({:0<12},{:0<12},{:0<12}), ",
-                    left_location.pose.position.x,
-                    left_location.pose.position.y,
-                    left_location.pose.position.z
-                );
-                printed = true;
-            }
-
-            if right_action.is_active(&session, xr::Path::NULL).unwrap() {
-                print!(
-                    "Right Hand: ({:0<12},{:0<12},{:0<12})",
-                    right_location.pose.position.x,
-                    right_location.pose.position.y,
-                    right_location.pose.position.z
-                );
-                printed = true;
-            }
-            if printed {
-                println!();
-            }
-
-            let rect = xr::Rect2Di {
-                offset: xr::Offset2Di { x: 0, y: 0 },
-                extent: xr::Extent2Di {
-                    width: swapchain.resolution.0 as _,
-                    height: swapchain.resolution.1 as _,
+            let rtv_desc = D3D11_RENDER_TARGET_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DARRAY,
+                Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                    Texture2DArray: D3D11_TEX2D_ARRAY_RTV {
+                        MipSlice: 0,
+                        FirstArraySlice: 0,
+                        ArraySize: VIEW_COUNT,
+                    },
                 },
             };
 
-            swapchain.handle.release_image().unwrap();
+            let mut rtv: Option<ID3D11RenderTargetView> = None;
+            d3d_device
+                .CreateRenderTargetView(&texture, Some(&rtv_desc), Some(&mut rtv))
+                .expect("Failed to create render target view");
 
-            frame_stream
-                .end(
-                    xr_frame_state.predicted_display_time,
-                    environment_blend_mode,
-                    &[
-                        &xr::CompositionLayerProjection::new().space(&stage).views(&[
-                            xr::CompositionLayerProjectionView::new()
-                                .pose(views[0].pose)
-                                .fov(views[0].fov)
-                                .sub_image(
-                                    xr::SwapchainSubImage::new()
-                                        .swapchain(&swapchain.handle)
-                                        .image_array_index(0)
-                                        .image_rect(rect),
-                                ),
-                            xr::CompositionLayerProjectionView::new()
-                                .pose(views[1].pose)
-                                .fov(views[1].fov)
-                                .sub_image(
-                                    xr::SwapchainSubImage::new()
-                                        .swapchain(&swapchain.handle)
-                                        .image_array_index(1)
-                                        .image_rect(rect),
-                                ),
-                        ]),
-                    ],
-                )
-                .unwrap();
-        }
+            mem::forget(texture);
+            rtv.unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    OpenXrSwapchain {
+        handle,
+        resolution,
+        render_target_views,
     }
-
-    println!("exiting cleanly");
 }
 
-const COLOR_FORMAT: u32 = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB.0 as u32;
-const VIEW_COUNT: u32 = 2;
-const VIEW_TYPE: xr::ViewConfigurationType = xr::ViewConfigurationType::PRIMARY_STEREO;
+// ============================================================================
+// MID-LEVEL HELPERS (rendering and pipeline management)
+// ============================================================================
 
-struct Swapchain {
-    handle: xr::Swapchain<xr::D3D11>,
-    resolution: (u32, u32),
-    render_target_views: Vec<ID3D11RenderTargetView>,
+/// Update constant buffer with view-projection and model matrices
+unsafe fn update_transforms(
+    device_context: &ID3D11DeviceContext,
+    constant_buffer: &ID3D11Buffer,
+    views: &[xr::View],
+    model_matrix: [f32; 16],
+) {
+    unsafe {
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        device_context
+            .Map(
+                constant_buffer,
+                0,
+                D3D11_MAP_WRITE_DISCARD,
+                0,
+                Some(&mut mapped),
+            )
+            .expect("Failed to map constant buffer");
+
+        let transform_data = mapped.pData as *mut TransformBuffer;
+        (*transform_data).view_proj[0] = compute_view_proj_matrix(&views[0]);
+        (*transform_data).view_proj[1] = compute_view_proj_matrix(&views[1]);
+        (*transform_data).model = model_matrix;
+
+        device_context.Unmap(constant_buffer, 0);
+    }
 }
 
+/// Set up graphics pipeline state for rendering
+unsafe fn setup_pipeline_state(
+    device_context: &ID3D11DeviceContext,
+    resources: &RenderResources,
+    swapchain_resolution: (u32, u32),
+) {
+    unsafe {
+        let viewport = D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: swapchain_resolution.0 as f32,
+            Height: swapchain_resolution.1 as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        device_context.RSSetViewports(Some(&[viewport]));
+
+        device_context.IASetInputLayout(&resources.input_layout);
+        device_context.VSSetShader(&resources.vertex_shader, None);
+        device_context.PSSetShader(&resources.pixel_shader, None);
+        device_context.VSSetConstantBuffers(0, Some(&[Some(resources.constant_buffer.clone())]));
+        device_context.OMSetBlendState(&resources.blend_state, None, 0xffffffff);
+        device_context.RSSetState(&resources.rasterizer_state);
+        device_context.OMSetDepthStencilState(&resources.depth_stencil_state, 0);
+        device_context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        let stride = mem::size_of::<Vertex>() as u32;
+        let offset = 0u32;
+        device_context.IASetVertexBuffers(
+            0,
+            1,
+            Some(&Some(resources.vertex_buffer.clone())),
+            Some(&stride),
+            Some(&offset),
+        );
+    }
+}
+
+/// Compile HLSL shader from source
 unsafe fn compile_shader(source: &str, entry_point: &str, target: &str) -> ID3DBlob {
     unsafe {
         let mut blob: Option<ID3DBlob> = None;
@@ -763,9 +860,12 @@ unsafe fn compile_shader(source: &str, entry_point: &str, target: &str) -> ID3DB
     }
 }
 
-// Helper function to compute view-projection matrix from OpenXR view
+// ============================================================================
+// LOW-LEVEL UTILITIES (math and matrix operations)
+// ============================================================================
+
+/// Compute combined view-projection matrix from OpenXR view
 fn compute_view_proj_matrix(view: &xr::View) -> [f32; 16] {
-    // Construct view matrix from pose
     let pose = &view.pose;
     let q = &pose.orientation;
     let p = &pose.position;
@@ -781,7 +881,6 @@ fn compute_view_proj_matrix(view: &xr::View) -> [f32; 16] {
     let wy = q.w * q.y;
     let wz = q.w * q.z;
 
-    // Build rotation matrix from quaternion
     let r00 = 1.0 - 2.0 * (yy + zz);
     let r01 = 2.0 * (xy - wz);
     let r02 = 2.0 * (xz + wy);
@@ -792,8 +891,7 @@ fn compute_view_proj_matrix(view: &xr::View) -> [f32; 16] {
     let r21 = 2.0 * (yz + wx);
     let r22 = 1.0 - 2.0 * (xx + yy);
 
-    // View matrix is inverse of camera transform: [R^T | -R^T * t]
-    // Transpose the rotation and transform the translation
+    // View matrix is inverse of camera transform
     let tx = -(r00 * p.x + r10 * p.y + r20 * p.z);
     let ty = -(r01 * p.x + r11 * p.y + r21 * p.z);
     let tz = -(r02 * p.x + r12 * p.y + r22 * p.z);
@@ -831,11 +929,10 @@ fn compute_view_proj_matrix(view: &xr::View) -> [f32; 16] {
         0.0,
     ];
 
-    // Multiply view * proj
     multiply_matrices(&view_matrix, &proj_matrix)
 }
 
-// Helper function to compute model matrix (translation + rotation)
+/// Compute model matrix with rotation around Y axis
 fn compute_model_matrix(rotation_angle: f32) -> [f32; 16] {
     let cos_a = rotation_angle.cos();
     let sin_a = rotation_angle.sin();
@@ -847,7 +944,39 @@ fn compute_model_matrix(rotation_angle: f32) -> [f32; 16] {
     ]
 }
 
-// Helper to multiply two 4x4 matrices
+/// Create model matrix from position, orientation, and scale
+fn model_matrix_from_pose(pos: &xr::Vector3f, quat: &xr::Quaternionf, scale: f32) -> [f32; 16] {
+    let xx = quat.x * quat.x;
+    let yy = quat.y * quat.y;
+    let zz = quat.z * quat.z;
+    let xy = quat.x * quat.y;
+    let xz = quat.x * quat.z;
+    let yz = quat.y * quat.z;
+    let wx = quat.w * quat.x;
+    let wy = quat.w * quat.y;
+    let wz = quat.w * quat.z;
+
+    [
+        scale * (1.0 - 2.0 * (yy + zz)),
+        scale * (2.0 * (xy + wz)),
+        scale * (2.0 * (xz - wy)),
+        0.0,
+        scale * (2.0 * (xy - wz)),
+        scale * (1.0 - 2.0 * (xx + zz)),
+        scale * (2.0 * (yz + wx)),
+        0.0,
+        scale * (2.0 * (xz + wy)),
+        scale * (2.0 * (yz - wx)),
+        scale * (1.0 - 2.0 * (xx + yy)),
+        0.0,
+        pos.x,
+        pos.y,
+        pos.z,
+        1.0,
+    ]
+}
+
+/// Multiply two 4x4 matrices
 fn multiply_matrices(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
     let mut result = [0.0f32; 16];
     for i in 0..4 {
@@ -858,4 +987,66 @@ fn multiply_matrices(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
         }
     }
     result
+}
+
+// ============================================================================
+// TYPE DEFINITIONS
+// ============================================================================
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct Vertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct TransformBuffer {
+    view_proj: [[f32; 16]; 2], // Two 4x4 matrices for stereo
+    model: [f32; 16],          // 4x4 model matrix
+}
+
+/// Direct3D 11 graphics context
+struct D3DContext {
+    device: ID3D11Device,
+    device_context: ID3D11DeviceContext,
+}
+
+/// Graphics pipeline resources (shaders, buffers, states)
+struct RenderResources {
+    vertex_shader: ID3D11VertexShader,
+    pixel_shader: ID3D11PixelShader,
+    input_layout: ID3D11InputLayout,
+    vertex_buffer: ID3D11Buffer,
+    constant_buffer: ID3D11Buffer,
+    blend_state: ID3D11BlendState,
+    rasterizer_state: ID3D11RasterizerState,
+    depth_stencil_state: ID3D11DepthStencilState,
+}
+
+/// OpenXR context (instance, system, session)
+struct OpenXrContext {
+    _instance: xr::Instance,
+    _system: xr::SystemId,
+    session: xr::Session<xr::D3D11>,
+    frame_wait: xr::FrameWaiter,
+    frame_stream: xr::FrameStream<xr::D3D11>,
+    stage: xr::Space,
+}
+
+/// OpenXR input tracking (actions and spaces)
+struct InputTracking {
+    action_set: xr::ActionSet,
+    right_action: xr::Action<xr::Posef>,
+    left_action: xr::Action<xr::Posef>,
+    right_space: xr::Space,
+    left_space: xr::Space,
+}
+
+/// OpenXR swapchain with render target views
+struct OpenXrSwapchain {
+    handle: xr::Swapchain<xr::D3D11>,
+    resolution: (u32, u32),
+    render_target_views: Vec<ID3D11RenderTargetView>,
 }
