@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 ctrlc = "3.5.1"
+glam = "0.30.9"
 openxr = { git = "https://github.com/philpax/openxrs.git", branch = "fix-static-with-rust-2024" }
 windows = { version = "0.62", features = [
     "Win32_Graphics_Direct3D",

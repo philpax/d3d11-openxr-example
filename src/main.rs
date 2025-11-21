@@ -12,6 +12,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use glam::{Mat4, Quat, Vec3};
 use openxr as xr;
 use windows::{
     Win32::Foundation::*, Win32::Graphics::Direct3D::Fxc::*, Win32::Graphics::Direct3D::*,
@@ -864,129 +865,56 @@ unsafe fn compile_shader(source: &str, entry_point: &str, target: &str) -> ID3DB
 // LOW-LEVEL UTILITIES (math and matrix operations)
 // ============================================================================
 
+/// Convert OpenXR Vector3f to glam Vec3
+fn to_vec3(v: &xr::Vector3f) -> Vec3 {
+    Vec3::new(v.x, v.y, v.z)
+}
+
+/// Convert OpenXR Quaternionf to glam Quat
+fn to_quat(q: &xr::Quaternionf) -> Quat {
+    Quat::from_xyzw(q.x, q.y, q.z, q.w)
+}
+
 /// Compute combined view-projection matrix from OpenXR view
 fn compute_view_proj_matrix(view: &xr::View) -> [f32; 16] {
     let pose = &view.pose;
-    let q = &pose.orientation;
-    let p = &pose.position;
 
-    // Convert quaternion to rotation matrix
-    let xx = q.x * q.x;
-    let yy = q.y * q.y;
-    let zz = q.z * q.z;
-    let xy = q.x * q.y;
-    let xz = q.x * q.z;
-    let yz = q.y * q.z;
-    let wx = q.w * q.x;
-    let wy = q.w * q.y;
-    let wz = q.w * q.z;
+    // Create view matrix (inverse of camera transform)
+    let rotation = to_quat(&pose.orientation);
+    let position = to_vec3(&pose.position);
+    let camera_transform = Mat4::from_rotation_translation(rotation, position);
+    let view_matrix = camera_transform.inverse();
 
-    let r00 = 1.0 - 2.0 * (yy + zz);
-    let r01 = 2.0 * (xy - wz);
-    let r02 = 2.0 * (xz + wy);
-    let r10 = 2.0 * (xy + wz);
-    let r11 = 1.0 - 2.0 * (xx + zz);
-    let r12 = 2.0 * (yz - wx);
-    let r20 = 2.0 * (xz - wy);
-    let r21 = 2.0 * (yz + wx);
-    let r22 = 1.0 - 2.0 * (xx + yy);
-
-    // View matrix is inverse of camera transform
-    let tx = -(r00 * p.x + r10 * p.y + r20 * p.z);
-    let ty = -(r01 * p.x + r11 * p.y + r21 * p.z);
-    let tz = -(r02 * p.x + r12 * p.y + r22 * p.z);
-
-    let view_matrix = [
-        r00, r01, r02, 0.0, r10, r11, r12, 0.0, r20, r21, r22, 0.0, tx, ty, tz, 1.0,
-    ];
-
-    // Construct projection matrix from FOV
+    // Construct projection matrix from asymmetric FOV
     let fov = &view.fov;
-    let tan_left = fov.angle_left.tan();
-    let tan_right = fov.angle_right.tan();
-    let tan_up = fov.angle_up.tan();
-    let tan_down = fov.angle_down.tan();
-
     let near = 0.1;
     let far = 100.0;
 
-    let proj_matrix = [
-        2.0 / (tan_right - tan_left),
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        2.0 / (tan_up - tan_down),
-        0.0,
-        0.0,
-        (tan_right + tan_left) / (tan_right - tan_left),
-        (tan_up + tan_down) / (tan_up - tan_down),
-        -far / (far - near),
-        -1.0,
-        0.0,
-        0.0,
-        -(far * near) / (far - near),
-        0.0,
-    ];
+    // Convert FOV angles to frustum bounds at near plane
+    let left = near * fov.angle_left.tan();
+    let right = near * fov.angle_right.tan();
+    let bottom = near * fov.angle_down.tan();
+    let top = near * fov.angle_up.tan();
 
-    multiply_matrices(&view_matrix, &proj_matrix)
+    let proj_matrix = Mat4::frustum_rh(left, right, bottom, top, near, far);
+
+    // Multiply view and projection matrices
+    (proj_matrix * view_matrix).to_cols_array()
 }
 
 /// Compute model matrix with rotation around Y axis
 fn compute_model_matrix(rotation_angle: f32) -> [f32; 16] {
-    let cos_a = rotation_angle.cos();
-    let sin_a = rotation_angle.sin();
-
-    // Rotation around Y axis, translated 3 meters forward (negative Z in OpenXR)
-    [
-        cos_a, 0.0, sin_a, 0.0, 0.0, 1.0, 0.0, 0.0, -sin_a, 0.0, cos_a, 0.0, 0.0, 1.5, -3.0,
-        1.0, // Position: 3m forward, 1.5m up from floor
-    ]
+    let rotation = Quat::from_rotation_y(rotation_angle);
+    let position = Vec3::new(0.0, 1.5, -3.0); // 3m forward, 1.5m up from floor
+    Mat4::from_rotation_translation(rotation, position).to_cols_array()
 }
 
 /// Create model matrix from position, orientation, and scale
 fn model_matrix_from_pose(pos: &xr::Vector3f, quat: &xr::Quaternionf, scale: f32) -> [f32; 16] {
-    let xx = quat.x * quat.x;
-    let yy = quat.y * quat.y;
-    let zz = quat.z * quat.z;
-    let xy = quat.x * quat.y;
-    let xz = quat.x * quat.z;
-    let yz = quat.y * quat.z;
-    let wx = quat.w * quat.x;
-    let wy = quat.w * quat.y;
-    let wz = quat.w * quat.z;
-
-    [
-        scale * (1.0 - 2.0 * (yy + zz)),
-        scale * (2.0 * (xy + wz)),
-        scale * (2.0 * (xz - wy)),
-        0.0,
-        scale * (2.0 * (xy - wz)),
-        scale * (1.0 - 2.0 * (xx + zz)),
-        scale * (2.0 * (yz + wx)),
-        0.0,
-        scale * (2.0 * (xz + wy)),
-        scale * (2.0 * (yz - wx)),
-        scale * (1.0 - 2.0 * (xx + yy)),
-        0.0,
-        pos.x,
-        pos.y,
-        pos.z,
-        1.0,
-    ]
-}
-
-/// Multiply two 4x4 matrices
-fn multiply_matrices(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
-    let mut result = [0.0f32; 16];
-    for i in 0..4 {
-        for j in 0..4 {
-            for k in 0..4 {
-                result[i * 4 + j] += a[i * 4 + k] * b[k * 4 + j];
-            }
-        }
-    }
-    result
+    let rotation = to_quat(quat);
+    let position = to_vec3(pos);
+    let scale_vec = Vec3::splat(scale);
+    Mat4::from_scale_rotation_translation(scale_vec, rotation, position).to_cols_array()
 }
 
 // ============================================================================
